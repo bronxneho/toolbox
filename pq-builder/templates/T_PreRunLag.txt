@@ -1,0 +1,71 @@
+let
+    // ---- inputs ----
+    ParamDate = Excel.CurrentWorkbook(){[Name={{DateRangeName:xlname=ReportDate}}]}[Content]{0}[Column1],
+    d         = Date.From(ParamDate),
+    Server    = {{Server:host=10.0.0.1}},
+    LineId    = {{LineId:text=LINE1}},
+
+    fmt = (dt) => Date.ToText(dt, "yyyy-MM-dd", "en-US") & " 00:00:00",
+    // wide enough that the shift is caught wherever it opens
+    WinStart = fmt(Date.AddDays(d, -1)),
+    WinEnd   = fmt(Date.AddDays(d, 1)),
+
+    // ISO weekday number: Mon=1 ... Sun=7, matching the "5 Friday" prefix
+    DayNum = Text.From(Date.DayOfWeek(d, Day.Monday) + 1),
+
+    Get = (endpoint as text, q as record) =>
+        let raw = Csv.Document(
+                Web.Contents("https://" & Server,
+                    [RelativePath = LineId & "/server/export/" & endpoint, Query = q]),
+                [Delimiter = ",", Encoding = 65001, QuoteStyle = QuoteStyle.Csv])
+        in  Table.PromoteHeaders(raw, [PromoteAllScalars = true]),
+
+    Col = (t as table, name as text) =>
+        let hit = List.Select(Table.ColumnNames(t), each Text.Lower(_) = Text.Lower(name))
+        in  if List.IsEmpty(hit) then error "Missing column: " & name else hit{0},
+
+    // ---- product side, narrowed to the one shift ----
+    Prod = Get("productByCrew", [
+        start = WinStart, end = WinEnd, groupBy = "jobByShift",
+        heading = "true", strictStart = "true" ]),
+
+    Tagged = Table.SelectRows(Prod, each
+        Text.StartsWith(Text.Trim(Text.From([UserName])), DayNum & " ") ),
+
+    ShiftIds = List.Distinct(List.Transform(
+        Table.Column(Tagged, "ShiftSpanId"), Text.From)),
+
+    Check = if List.Count(ShiftIds) = 0 then
+                error "No shift labelled '" & DayNum & " ...' in window"
+            else if List.Count(ShiftIds) > 1 then
+                error "Label matched " & Text.From(List.Count(ShiftIds)) & " shifts: "
+                      & Text.Combine(ShiftIds, ", ")
+            else ShiftIds{0},
+
+    ProdKeyed = Table.RenameColumns(Tagged, {{Col(Tagged, "JobSpanID"), "JobKey"}}),
+    ProdTyped = Table.TransformColumnTypes(ProdKeyed, {{"StartTime", type datetime}}),
+
+    // ---- events, same window, same shift ----
+    Ev = Get("events", [
+        start = WinStart, end = WinEnd,
+        heading = "true", strictStart = "false" ]),
+    EvKeyed = Table.RenameColumns(Ev, {{Col(Ev, "JobSpanId"), "JobKey"}}),
+    EvTyped = Table.TransformColumnTypes(EvKeyed, {{"StartTime", type datetime}}),
+
+    EvShift = Table.SelectRows(EvTyped, each Text.From([ShiftSpanId]) = Check),
+    RunOnly = Table.SelectRows(EvShift, each
+        List.Contains({"running", "run slow"}, Text.Lower(Text.From([SpanClass]))) ),
+
+    FirstRun = Table.Group(RunOnly, {"JobKey"},
+        {{"TrueStart", each List.Min([StartTime]), type datetime}}),
+
+    // ---- stitch ----
+    Joined   = Table.NestedJoin(ProdTyped, {"JobKey"}, FirstRun, {"JobKey"}, "ev", JoinKind.LeftOuter),
+    Expanded = Table.ExpandTableColumn(Joined, "ev", {"TrueStart"}, {"TrueStart"}),
+
+    WithLag = Table.AddColumn(Expanded, "PreRunMinutes", each
+        if [TrueStart] = null then null
+        else Number.Round(Duration.TotalMinutes([TrueStart] - [StartTime]), 1),
+        type number)
+in
+    WithLag
